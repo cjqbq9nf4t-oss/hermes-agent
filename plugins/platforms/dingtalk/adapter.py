@@ -57,6 +57,11 @@ from gateway.platforms._shared import (
 )
 from gateway.platforms.send_targets import StandaloneSendPolicy
 from plugins.platforms.dingtalk.inbound import collect_download_codes, extract_media, extract_text
+from plugins.platforms.dingtalk.media import (
+    cache_path_if_safe, cache_resolved_url, describe_failure, download_url_from, failure_note,
+    filename_of, is_remote_url, kind_for, looks_like_local_path, needs_download_api, read_field,
+    redact_code, robot_code_for, scrub_exception, write_field,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -478,9 +483,12 @@ class DingTalkAdapter(BasePlatformAdapter):
             if len(self._session_webhooks) >= _SESSION_WEBHOOKS_MAX:
                 self._session_webhooks.pop(next(iter(self._session_webhooks)))  # evict oldest (dict is non-empty here)
             self._session_webhooks[chat_id] = (session_webhook, getattr(message, "session_webhook_expired_time", 0) or 0)
-        await self._resolve_media_codes(message)  # download codes -> URLs so vision tools can use them
+        await self._resolve_media_codes(message)  # download codes -> local cache files (admission rejects remote URLs)
         text = self._extract_text(message)
         msg_type, media_urls, media_types = self._extract_media(message)
+        media_notes = getattr(message, "_hermes_dingtalk_media_notes", None) or []
+        if media_notes:
+            text = "\n".join(part for part in (text, *media_notes) if part)
         if not text and not media_urls:
             return logger.debug("[%s] Empty message, skipping", self.name)
         source = self.build_source(chat_id=chat_id, chat_name=getattr(message, "conversation_title", None), chat_type="group" if is_group else "dm",
@@ -665,35 +673,119 @@ class DingTalkAdapter(BasePlatformAdapter):
         except Exception:
             logger.debug("[%s] _send_emotion %s failed", self.name, action, exc_info=True)
 
+    def _note_media_failure(self, message: ChatbotMessage, note: str) -> None:
+        notes = getattr(message, "_hermes_dingtalk_media_notes", None)
+        if not isinstance(notes, list):
+            notes = []
+            setattr(message, "_hermes_dingtalk_media_notes", notes)
+        if note and note not in notes:
+            notes.append(note)
+
     async def _resolve_media_codes(self, message: ChatbotMessage) -> None:
-        """Resolve download codes in the message to real URLs (in place, in parallel)."""
+        """Replace each download code with a cache file path, in place.
+
+        The download API returns a short-lived URL. Admission only accepts a local cache file,
+        so the URL is downloaded here and never stored on the event. One shared note is recorded
+        on the message when every attachment is blocked before a per-file attempt.
+        """
+        pending = [(read_field(obj, key), obj, key) for obj, key in collect_download_codes(message)]
+        pending = [(code, obj, key) for code, obj, key in pending if code]
+        if not pending:
+            return
+        blocked = [item for item in pending if needs_download_api(item[0])]
+        ready = [item for item in pending if not needs_download_api(item[0])]
+        token, robot_code = "", ""
+        if blocked:
+            token, robot_code, blocker = await self._prepare_download_api(message)
+            if blocker:
+                # Drop the code so a failed fetch cannot become media_urls. An absolute code
+                # would otherwise pass the local-path admission check and refuse the text too.
+                self._note_media_failure(message, blocker)
+                for _, obj, key in blocked:
+                    write_field(obj, key, "")
+                pending = ready
+            else:
+                pending = [*blocked, *ready]
+        else:
+            pending = ready
+        if pending:
+            await asyncio.gather(*(
+                self._fetch_download_url(code, robot_code, token, obj, key, message) for code, obj, key in pending
+            ))
+
+    async def _prepare_download_api(self, message: ChatbotMessage) -> tuple[str, str, str]:
+        """``(token, robot_code, blocker)``. A blocker means the download API must not be called."""
+        if not self._robot_sdk:
+            logger.warning("[%s] Robot SDK not initialized, cannot resolve media code", self.name)
+            return "", "", failure_note("sdk")
         token = await self._get_access_token()
         if not token:
-            return
-        robot_code = getattr(message, "robot_code", None) or self._client_id
-        pairs = [(getattr(obj, key, None) if hasattr(obj, key) else obj.get(key), obj, key) for obj, key in collect_download_codes(message)]
-        tasks = [self._fetch_download_url(code, robot_code, token, obj, key) for code, obj, key in pairs if code]
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            logger.warning("[%s] DingTalk media download skipped: no access token", self.name)
+            return "", "", failure_note("token")
+        robot_code = robot_code_for(message, self._robot_code, self._client_id)
+        if not robot_code:
+            logger.warning("[%s] DingTalk media download skipped: empty robotCode", self.name)
+            return "", "", failure_note("robot")
+        return token or "", robot_code, ""
 
-    async def _fetch_download_url(self, code: str, robot_code: str, token: str, obj, key: str) -> None:
-        """Fetch the download URL for one code via the robot SDK and write it back to ``obj[key]``."""
-        if not self._robot_sdk:
-            return logger.warning("[%s] Robot SDK not initialized, cannot resolve media code", self.name)
+    async def _download_url_for_code(self, code: str, robot_code: str, token: str) -> str:
+        """Official request: ``downloadCode`` + the receiving bot's ``robotCode``, token in the header.
+
+        A value that is already an http(s) URL is the API's ``downloadUrl`` and is not sent back
+        as a download code.
+        """
+        if is_remote_url(code):
+            return code.strip()
+        response = await self._sdk_call(
+            self._robot_sdk.robot_message_file_download_with_options_async,
+            dingtalk_robot_models.RobotMessageFileDownloadRequest(download_code=code, robot_code=robot_code),
+            dingtalk_robot_models.RobotMessageFileDownloadHeaders, token)
+        return download_url_from(response)
+
+    async def _fetch_download_url(self, code: str, robot_code: str, token: str, obj, key: str,
+                                  message: Optional[ChatbotMessage] = None) -> None:
+        """Cache one code and write the local path back to ``obj[key]``. Failures clear the code.
+
+        Leaving a failed code in place would publish it as ``media_urls``. An absolute code
+        (or a remote URL) is then either copied into the session or stripped with a generic
+        "could not be retrieved" note. Clearing it keeps the text, and the note says why.
+        """
+        if cache_path_if_safe(code):
+            return
+        if looks_like_local_path(code):
+            write_field(obj, key, "")
+            if message is not None:
+                self._note_media_failure(message, failure_note("unsafe"))
+            logger.warning("[%s] DingTalk media code named a local path and was not admitted", self.name)
+            return
+        url = ""
         try:
-            response = await self._sdk_call(self._robot_sdk.robot_message_file_download_with_options_async,
-                                            dingtalk_robot_models.RobotMessageFileDownloadRequest(download_code=code, robot_code=robot_code),
-                                            dingtalk_robot_models.RobotMessageFileDownloadHeaders, token)
-            body = response.body if response else None
-            url = getattr(body, "download_url", None) if body else None
-            if not body:
-                logger.warning("[%s] Failed to download media: empty response for code %s", self.name, code)
-            elif url and hasattr(obj, key):
-                setattr(obj, key, url)
-            elif url and isinstance(obj, dict):
-                obj[key] = url
-        except Exception as e:
-            logger.error("[%s] Error resolving media code %s: %s", self.name, code, e)
+            url = await self._download_url_for_code(code, robot_code, token)
+            if not url:
+                logger.warning("[%s] DingTalk file download returned no downloadUrl (%s)", self.name, redact_code(code))
+                write_field(obj, key, "")
+                if message is not None:
+                    self._note_media_failure(message, failure_note("empty"))
+                return
+            path = await cache_resolved_url(url, kind=kind_for(message, obj, key), filename=filename_of(obj))
+        except Exception as exc:  # health: allow BLE001 -- SDK/HTTP/cache boundary; traceback is secret-scrubbed
+            summary = describe_failure(exc, secrets=(code, token, url))
+            scrub_exception(exc, (code, token, url))
+            stage = "unsafe" if summary == "download URL blocked by safety check" else ("cache" if url else "api")
+            logger.warning("[%s] DingTalk inbound media failed: %s (%s)", self.name, summary, redact_code(code), exc_info=True)
+            if not cache_path_if_safe(read_field(obj, key)):
+                write_field(obj, key, "")
+            if message is not None:
+                self._note_media_failure(message, failure_note(stage, summary if stage != "unsafe" else ""))
+            return
+        admitted = cache_path_if_safe(path)
+        if not admitted:
+            logger.warning("[%s] Refused DingTalk media outside the platform cache (%s)", self.name, redact_code(code))
+            write_field(obj, key, "")
+            if message is not None:
+                self._note_media_failure(message, failure_note("unsafe"))
+            return
+        write_field(obj, key, admitted)
 
     @staticmethod
     def _normalize_markdown(text: str) -> str:

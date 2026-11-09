@@ -21,6 +21,11 @@ EXT_MAP = {
 # rich-text runtime type → (media_types entry, MessageType promotion when still TEXT)
 _RICH_MEDIA = {"image": ("image", MessageType.PHOTO), "video": ("video", MessageType.VIDEO), "file": ("application/octet-stream", MessageType.DOCUMENT)}
 
+# Callback download-code keys, most specific first. pictureDownloadCode is only a fallback:
+# the file-download API takes the message's downloadCode, and sending both keys makes a second
+# call with a code the API may reject.
+_DOWNLOAD_KEYS = ("downloadCode", "download_code", "pictureDownloadCode")
+
 
 def _extensions(message: Any) -> Any:
     return getattr(message, "extensions", {}) or {}
@@ -91,6 +96,45 @@ def _rich_item_text(item: Any) -> str:
     return getattr(item, "text", "") or ""
 
 
+def _code_value(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _first_download_key(item: Any) -> str:
+    """The one download-code field ``extract_media`` will publish, or ``""``."""
+    if not isinstance(item, dict):
+        return ""
+    for key in _DOWNLOAD_KEYS:
+        if _code_value(item.get(key)):
+            return key
+    return ""
+
+
+def _append_extension_media(message: Any, msg_type: MessageType, media_urls: list[str], media_types: list[str]) -> MessageType:
+    """file / image / picture payloads whose code lives in ``extensions['content']``.
+
+    ``picture`` is normally ``image_content`` (the stream SDK). When that attribute is absent
+    the same code is still in the extension bucket and must be published once.
+    """
+    msg_type_str = getattr(message, "message_type", "") or ""
+    if msg_type_str not in ("file", "image", "picture"):
+        return msg_type
+    ext_content = _ext_content(message) or {}
+    key = _first_download_key(ext_content)
+    dl_code = _code_value(ext_content.get(key)) if key else ""
+    if dl_code and dl_code not in media_urls:
+        fname = ext_content.get("fileName", "") if isinstance(ext_content.get("fileName", ""), str) else ""
+        mime = EXT_MAP.get(fname.rsplit(".", 1)[-1].lower() if fname and "." in fname else "", "application/octet-stream")
+        media_urls.append(dl_code)
+        media_types.append(mime)
+        if msg_type == MessageType.TEXT:  # image messages, and files with image MIME (a .png attachment) → PHOTO
+            photo = msg_type_str in ("image", "picture") or mime.startswith("image/")
+            msg_type = MessageType.PHOTO if photo else MessageType.DOCUMENT
+    elif msg_type_str == "picture" and msg_type == MessageType.TEXT:
+        msg_type = MessageType.PHOTO
+    return msg_type
+
+
 def extract_text(message: Any) -> str:
     """Extract plain text from a DingTalk chatbot message. Handles both SDK shapes: legacy ``message.text`` dict ``{"content": ...}`` and >= 0.20 ``TextContent``
     (whose ``__str__`` is ``"TextContent(content=...)"`` — always read ``.content`` first)."""
@@ -111,17 +155,19 @@ def extract_media(message: Any) -> tuple[MessageType, list[str], list[str]]:
     media_urls: list[str] = []
     media_types: list[str] = []
     image_content = getattr(message, "image_content", None)
-    if download_code := (getattr(image_content, "download_code", None) if image_content else None):
-        media_urls.append(download_code)
+    image_code = _code_value(getattr(image_content, "download_code", None) if image_content else None)
+    if image_code:
+        media_urls.append(image_code)
         media_types.append("image")
         msg_type = MessageType.PHOTO
     for item in _rich_list(message) or ():
         if not isinstance(item, dict):
             continue
-        dl_code = item.get("downloadCode") or item.get("download_code") or ""
+        key = _first_download_key(item)
+        dl_code = _code_value(item.get(key)) if key else ""
         if not dl_code:
             continue
-        item_type = item.get("type", "")
+        item_type = item.get("type", "") or ("picture" if key == "pictureDownloadCode" else "")
         mapped = DINGTALK_TYPE_MAPPING.get(item_type, "file")
         # "voice" items are native voice notes → STT (VOICE); "audio" file uploads stay AUDIO.
         mime, promoted = ("audio", MessageType.VOICE if item_type == "voice" else MessageType.AUDIO) if mapped == "audio" else _RICH_MEDIA[mapped]
@@ -130,9 +176,7 @@ def extract_media(message: Any) -> tuple[MessageType, list[str], list[str]]:
         if msg_type == MessageType.TEXT:
             msg_type = promoted
     msg_type_str = getattr(message, "message_type", "") or ""
-    if msg_type_str == "picture" and not media_urls:
-        msg_type = MessageType.PHOTO
-    elif msg_type_str == "richText":
+    if msg_type_str == "richText":
         # Only re-derive when the scan above left TEXT — resetting a VOICE/AUDIO/VIDEO/DOCUMENT
         # promotion here dropped native voice notes back to TEXT and skipped STT.
         if msg_type == MessageType.TEXT and any("image" in t for t in media_types):
@@ -142,30 +186,29 @@ def extract_media(message: Any) -> tuple[MessageType, list[str], list[str]]:
         # run.py's transcription enrichment overwrites it with a failed STT attempt.
         if msg_type == MessageType.TEXT:
             msg_type = MessageType.VOICE
-    elif msg_type_str in ("file", "image"):
-        ext_content = _ext_content(message) or {}
-        if dl_code := ext_content.get("downloadCode") or "":
-            fname = ext_content.get("fileName", "")
-            mime = EXT_MAP.get(fname.rsplit(".", 1)[-1].lower() if fname and "." in fname else "", "application/octet-stream")
-            media_urls.append(dl_code)
-            media_types.append(mime)
-            if msg_type == MessageType.TEXT:  # image messages, and files with image MIME (a .png attachment) → PHOTO
-                msg_type = MessageType.PHOTO if (msg_type_str == "image" or mime.startswith("image/")) else MessageType.DOCUMENT
+    elif msg_type_str in ("file", "image", "picture"):
+        msg_type = _append_extension_media(message, msg_type, media_urls, media_types)
     return msg_type, media_urls, media_types
 
 
 def collect_download_codes(message: Any) -> list[tuple[Any, str]]:
-    """Return ``(container, key)`` pairs whose download code should be resolved to a URL."""
+    """Return ``(container, key)`` pairs the adapter resolves to a local cache file.
+
+    The key is the one ``extract_media`` reads, so a resolved path replaces the code the
+    event will publish. Legacy ``rich_text`` lists are included, matching ``_rich_list``.
+    """
     codes: list[tuple[Any, str]] = []
     img_content = getattr(message, "image_content", None)
-    if img_content and getattr(img_content, "download_code", None):
+    img_code = _code_value(getattr(img_content, "download_code", None) if img_content else None)
+    if img_code:
         codes.append((img_content, "download_code"))
-    rich_text = getattr(message, "rich_text_content", None)
-    for item in (getattr(rich_text, "rich_text_list", []) or []) if rich_text else []:
-        if isinstance(item, dict):
-            codes.extend((item, key) for key in ("downloadCode", "pictureDownloadCode", "download_code") if item.get(key))
-    if (getattr(message, "message_type", "") or "") in ("file", "image"):
+    for item in _rich_list(message) or ():
+        if isinstance(item, dict) and (key := _first_download_key(item)):
+            codes.append((item, key))
+    msg_type = getattr(message, "message_type", "") or ""
+    if msg_type in ("file", "image", "picture"):
         ext_content = _ext_content(message)
-        if ext_content and ext_content.get("downloadCode"):
-            codes.append((ext_content, "downloadCode"))
+        if isinstance(ext_content, dict) and (key := _first_download_key(ext_content)):
+            if _code_value(ext_content.get(key)) != img_code:
+                codes.append((ext_content, key))
     return codes
